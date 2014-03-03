@@ -1,0 +1,64 @@
+function samplesToRequest = classifyAndSelectDoc( nToTry, nRequests, featureFile, labelFile, outputFile )
+
+display('classifying then selecting next document to label...');
+
+if ischar(nToTry)
+    nToTry = str2double(nToTry);
+end
+
+if ischar(nRequests)
+    nRequests = str2double(nRequests);
+end
+
+display(['evaluating: ' num2str(nToTry)]);
+
+X = dlmread(featureFile); %should produce X
+T = dlmread(labelFile); %should produce T. For docs with no label, the whole row is zero.
+if size(T,2)==1 || size(T,1)==1
+    
+    if size(T,1)>size(T,2)
+        T = T';
+    end
+    
+    nClasses = max(T);
+    Tmat = zeros(length(T), nClasses);
+    Tmat(sub2ind(size(Tmat), 1:length(T), T)) = 1;
+    T = Tmat;
+else
+    nClasses = size(T,2);
+end
+
+%display the time now
+datestr(now)
+
+labIdxs = sum(T,2)>0; %indexes of labelled data points
+unlabIdxs = find(sum(T,2)==0);
+
+if ~exist('nRequests','var')
+    nRequests = 10; %this is currently ignored and fixed anyway
+end
+if ~exist('nToTry','var')
+    nToTry = 50;
+end
+
+currentTrain = X(labIdxs,:);
+currentLabels = T(labIdxs,:);
+currentTest = X(unlabIdxs,:);
+
+[P_class,P_feat_class,Alpha] = multi_classifier(currentTrain,currentLabels);
+P = multi_classify(P_class,P_feat_class,currentTest);
+
+%display the time now
+datestr(now)    
+
+testResults = cell(size(P,2),1);
+for j=1:nClasses
+    testResults{j} = P(:, j)';
+end
+
+samplesToRequest = unlabIdxs(labelSelectApproxIG( nToTry, nRequests, ...
+    P, currentTest, Alpha, currentLabels, nClasses));
+
+display(['chosen index: ' num2str(samplesToRequest)]);  
+
+dlmwrite(outputFile, samplesToRequest);

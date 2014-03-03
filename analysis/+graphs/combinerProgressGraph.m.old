@@ -1,0 +1,30 @@
+nFigs = size(progressMonitor.error{1},1);
+
+for f=1:nFigs+1
+    for c=1:length(progressMonitor.error)
+        error = progressMonitor.error{c};
+        
+        if f>nFigs
+            e = sum(error(1:nFigs-1),1);
+        else
+            e = error(f, :);
+        end
+        plot(1:size(error,2), e, 'linewidth', 2);
+        hold all;
+    end
+
+    fs = 24;
+    set(gca, 'FontSize', fs);
+    legend({'IBCC-VB', 'IBCC-Gibbs'});
+    xlabel('No. Iterations');
+    
+    if f==nFigs
+        ylabel('Entropy');
+        title('Decreasing Uncertainty in Target Labels');
+    else
+        ylabel('AUC');%'Total absolute error over 1000 data points');
+        title(['Class ' num2str(f)]);%Absolute error against number of iterations of IBCC methods');
+    end
+    
+    set(gca, 'fontsize', fs) 
+end

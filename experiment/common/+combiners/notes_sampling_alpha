@@ -1,0 +1,56 @@
+           %requires rejection sampling!
+            %real distribution we want to sample:
+            % Using A as shorthand for Alpha
+            % and L as shorthand for Lambda.
+            
+            % p(A|Conf,P,T,C) 
+            % = p(A)p(Conf,P,T,C|A)/p(Conf,P,T,C)
+            % = p(A)p(C|P,T,A,Conf)p(Conf|A,P,T)p(T|P,A)p(P|A) / p(Conf,P,T,C)
+            
+            % Each component is defined as follows:
+            
+            % p(A) = exp(A; L)
+            % p(C|P,T,A, Conf) = p(C|Conf, T) = prod_k(prod_i(Conf_ti,cik))
+            % p(Conf|A,P,T) = p(Conf|A) = dirich(Conf; A)
+            % p(T|P,A) = p(T|P) = prod_i(P_ti)
+            % p(P|A) = p(P) = dirich(P; nu)
+            % ignore the denominator p(Conf,P,T,C) for now.
+            
+            % Most terms don't vary with A so are constant scale factors.
+            % If we ignore these, we wish to sample A from function f(A):
+            
+            % A ~ f(A) = exp(A; L)dirich(Conf; A)
+            % exp(A; L) = gamma(A; shape=1, L)
+            
+            %Cannot use conversion to gammas because we need to use a known 
+            %value of Conf and cannot go back from that to Y, which is the
+            %output of the individual gamma function.
+            
+            % dirch(Conf; A) = gamma_dist(Y; A,1) / sum(gamma_dist(Y; A,1))
+            % A ~ f(A) = gamma_dist(A; shape=1, L) gamma_dist(Y; A, 1) / sum(gamma_dist(Y; A,1))
+            
+            %however, we can use adaptive rejection sampling (ARS)...
+            % A ~ f(A) = exp(A; L)dirich(Conf; A)
+            
+            % B(A) = prod_i_K(gamma(Ai)) / gamma(sum(A)) 
+            
+            % f(A) = gamma(sum(A)) * prod_i_K[ Li * e^-LiAi * Confi^(Ai-1) /
+            % gamma(Ai) ]
+            % lnf(A) = ln gamma(sum(A)) + sum_i_K[ ln(Li) -LiAi +(Ai-1)ln(confi) -ln gamma(Ai) ]
+            
+            % To use the standard ARS method f(A) must be log-concave, so
+            % lnf(Ai)'' = d^2 lnf(A) / (d Ai)^2 must be negative for all
+            % values of A and all components i of A. 
+            
+            % lnf(Ai)' = d lnf(A) / d Ai = digamma(sum_i_K[Ai]) - Li + ln(Confi) - digamma(Ai)
+            
+            % lnf(Ai)'' = trigamma(sum(A)) + 0 - trigamma(Ai)
+           
+            % The trigamma function is defined as: 
+            
+            % trigamma(a) = - integral_0_1[ x^(a-1) * lnx / (1-x) dx ]
+            
+            % Thus trigamma(a) decreases with its argument a. Here we have
+            % each component of A, Ai >= 0, 
+            % so trigamma(sum(A)) <= trigamma(Ai). Therefore
+            % trigamma(sum(A)) - trigamma(A) <= 0. 

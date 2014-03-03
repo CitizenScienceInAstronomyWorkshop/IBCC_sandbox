@@ -1,0 +1,856 @@
+classdef DynIbccVb < combiners.bcc.IbccVb
+    %DYNIBCCVB Dynamic IBCC-VB
+    %   For base classifiers that change. Uses a dynamic
+    %   dirichlet-multinomial model to determine the confusion matrices
+    %   after each data point.
+    
+    properties
+        Wmean0; %weights - the state object; related to posterior Alphas
+        P0; %covariance of the weights
+        
+        Alpha_t = [];
+        AlphaSum = []; 
+        
+        sepConfMatrix = false; %treat the expected class label as a continuous input variable (false) or separate into two binary inputs woth separate covariances
+        initAll = false;
+        
+        Wmean_filter;
+        P_filter;
+%         k_t;
+        q_t;
+        eta_tminus;
+        r_tminus;
+        K_kal;
+        bigLambdaBar;
+        smallLambdaBar;
+%         delta_Wmean;
+%         delta_Ppost;
+%         h;
+        C3;
+        
+        minUpdateSize = 0;%0.005;
+        minUpdateSize1 = 0;%0.001;
+        minUpdateSize3 = 0;%0.001;
+        minUpdateSize2 = 0%;0.02;
+        
+%         initialET = [];
+%         initialC = [];
+
+        C1_desparse = [];
+    end
+    
+    methods(Static)
+        function sl = shortLabel
+            sl = 'DynIbccVb';
+        end      
+        function sl = shortLabelSep
+            sl = 'DynIbccVb-sepCov';
+        end
+        function sl = shortLabelInitAll
+            sl = 'DynIbccVB-initall';
+        end   
+        
+        function y = getAlpha(nScores, c, k_t, m_t)
+            y = zeros(1, nScores); %from C
+            if c==0 %unknown
+                y = k_t ./ m_t;
+            else
+                y(c) = 1;
+            end             
+        end        
+    end
+    
+    methods
+        
+        function obj = DynIbccVb(bccSettings, nAgents, K, targets, agents, nClasses, nScores)
+            obj@combiners.bcc.IbccVb(bccSettings, nAgents, K, targets, agents, nClasses, nScores);
+            obj.label = 'Dynamic VB I.B.C.C.'; 
+            obj.Alpha = [];            
+        end        
+        
+        function [Wmean0 P0] = alphaToStateDist(obj, Alpha0, C) 
+            %convert Alpha to distribution over state variables W with mean
+            %Wmean0 and covariance P0
+            Wmean0 = log(Alpha0./(repmat(sum(Alpha0, 2), 1, obj.nScores)-Alpha0)); %one cell entry per data point
+            P0 = zeros(obj.nClasses, obj.nClasses, length(C{1}), obj.nScores); %one cell for each class
+            for s=1:obj.nScores
+                for j=1:obj.nClasses
+                    P0(j,j,:,s) = 1./Alpha0(j,s,1) + 1./(sum(Alpha0(j,:,1), 2)-Alpha0(j,s,1));
+                end
+            end
+        end
+        
+        %modify this to also initialise the Wmean and P, and dynamic lnP
+        function [lnPi, lnP, ET, Tind] = initVariables(obj, C, nAssets)  
+
+            [obj.Wmean0 obj.P0] = obj.alphaToStateDist(obj.Alpha0, C);
+            
+            if nargin < 5
+                nAssets = length(obj.targets);
+            end
+                        
+            if sum(obj.Nu0)==0
+                obj.Nu0 = 0.5;
+            end
+            if isempty(obj.lnK)
+                nu = obj.Nu0;
+                for j=1:obj.nClasses
+                    nu(j) = nu(j) + sum(obj.targets==j);
+                end
+                lnP = psi(nu) - psi(sum(nu)); 
+            else
+                lnP = obj.lnK;
+            end
+                    
+            ET = initET(obj, C, nAssets, lnP);
+            
+            unknownIdxs = ~ismember(C{2}, find(obj.targets>0));
+            Cknown = C;
+            Cknown{3}(unknownIdxs) = 0;
+            
+            if obj.initAll
+                lnPi = obj.expectedLnPi(C, ET);
+            else
+                lnPi = obj.expectedLnPi(Cknown, ET);
+            end
+            Tind = ET;
+        end
+        
+        function r_tminus = calculateR(obj, ET_n, P_tminus)
+            r_tminus = zeros(1, obj.nScores);
+            for s=1:obj.nScores
+                r_tminus(1, s) = ET_n' * P_tminus(:,:,s) * ET_n;
+            end
+        end
+                
+        function AlphaBundle = updateAlpha(obj, C, ET, ~, ~)
+            
+            %What would be the effect of automatically grouping updates.
+            %E.g. updates that are consistent (where q_t==0, i.e. don't increase uncertainty) can be grouped
+            %together to remove the need to update each step. 
+            %Drawbacks: less smooth change, potentially more mistakes at state-change boundaries 
+            %Advantage: less fluctuation, more consolidation of data from
+            %when the agent was in a particular state        
+            
+            if obj.nScores > 2
+                AlphaBundle = obj.updateAlphaMultiClass(C, ET);
+                return;
+            end
+            
+            nResp = length(C{1});
+            if isempty(obj.Alpha)
+                obj.Alpha = zeros(obj.nClasses, obj.nScores, nResp);
+                obj.Alpha_t = zeros(obj.nScores, nResp); %for the distribution over eta_t given all c and t
+                obj.AlphaSum = zeros(obj.nClasses, obj.nScores, nResp); %each score is a pseudocount from a different total!
+            elseif iscell(obj.Alpha)
+                obj.Alpha_t = obj.Alpha{2};
+                obj.Alpha = obj.Alpha{1};                
+            end
+
+            nClassifiers = length(obj.C1_desparse);%max(C{1});                
+       
+            startFrom = 1;
+            backTo = 1;
+            prevObs = zeros(1, nClassifiers);    
+            subsObs = zeros(1, nClassifiers);
+            
+            nNewPoints = nResp - size(obj.q_t,2);
+            
+            obj.q_t = [obj.q_t zeros(1,nNewPoints)];
+            obj.eta_tminus = [obj.eta_tminus; zeros(nNewPoints, 1)];
+            obj.r_tminus = [obj.r_tminus; zeros(nNewPoints, 1)];
+            r_tpost = zeros(nResp, 1);
+            obj.K_kal = zeros(obj.nClasses, nResp);
+            
+            I = eye(obj.nClasses, obj.nClasses);
+            
+            %previous observation for each classifier. 0 means no observations
+            Wmean_post = zeros(obj.nClasses, nResp);
+            P_post = zeros(obj.nClasses, obj.nClasses, nResp);
+            
+            eta_tpost = zeros(nResp, 1);
+
+            R = zeros(nResp, 1);
+                        
+            reshapedP0 = reshape(obj.P0(:,:,1,1), obj.nClasses, obj.nClasses);            
+            
+            %FORWARD PASS
+            for n=startFrom:nResp      
+                                
+                k = obj.C1_desparse(n);
+                tminus = prevObs(k);
+                
+                c = C{3}(n);
+                i = C{2}(n);
+                h = ET(:,i);
+%                 if sum(h)==0
+%                     display('corrupt ET');
+%                 end
+                if tminus==0
+                    Wmean_tminus = obj.Wmean0(:,1,n);
+                    P_tminus = reshapedP0;
+                    q_tminus = 0;
+                else
+                    Wmean_tminus = Wmean_post(:,tminus);
+                    P_tminus = P_post(:,:,tminus);
+                    q_tminus = obj.q_t(tminus);
+                end    
+                
+                eta_tminus_n = h' * Wmean_tminus;
+
+                P_tminus = P_tminus + obj.settings.changeRateMod*q_tminus*I;
+                r_tminus_n = h' * P_tminus * h;                
+
+                k_t = (1./r_tminus_n) .* (1+exp(eta_tminus_n));
+
+                obj.eta_tminus(n,:) = eta_tminus_n; 
+                obj.r_tminus(n, :) = r_tminus_n;
+
+                m_t = k_t .* (1+exp(-eta_tminus_n));
+
+                y = 0; 
+                if c==1
+                    y = 1;
+                elseif c==0 %unknown
+                    y = k_t ./ m_t;
+                end 
+                
+                %estimate posteriors of eta and r
+                k_tpost = k_t + y;
+                denom = m_t-k_t+1-y;
+                eta_tpost(n) = log(k_tpost ./ denom);
+                r_tpost(n) = (1./k_tpost) + (1./denom);
+                z = (eta_tpost(n) - eta_tminus_n);
+                
+                u_tpost = (k_tpost/(m_t+1))*(1-(k_tpost/(m_t+1)));%(k_tpost*denom)/ ((m_t+1)^2);
+                u_tminus  = (k_t/m_t)*(1-(k_t/m_t));%(k_t*(m_t-k_t))/ (m_t^2);
+
+                obj.q_t(n) = (u_tpost>u_tminus) * (u_tpost-u_tminus);%adding the uncertainty in pi as a substitute for the uncertainty in the label, since this model is about predicting pi
+                %                 if c==0 
+%                     labelUncertainty = y.*(1-y);
+%                     obj.q_t(n) = obj.q_t(n) + sum(labelUncertainty);      
+%                 end
+
+                corrections = isinf(r_tpost(n));
+                if corrections
+                    r_tpost(n) = r_tminus_n;
+                end
+                
+                K_kal_n = P_tminus' * h ./ r_tminus_n;
+                obj.K_kal(:,n) = K_kal_n;
+                
+                R(n) = 1-(r_tpost(n)./r_tminus_n);   
+
+                %calculate weight updates
+                
+                Wmean_post(:,n) = Wmean_tminus + K_kal_n .*z;                    
+                    
+                Kh = K_kal_n * h' ;
+                P_post(:,:,n) = P_tminus - (Kh * P_tminus .* R(n));
+                
+                prevObs(k) = n;
+            end
+ 
+            %used to be nClassifiers, could use a lot of memory
+            obj.bigLambdaBar = zeros(obj.nClasses, obj.nClasses, nResp);
+            obj.smallLambdaBar = zeros(obj.nClasses, nResp);
+                            
+            %BACKWARD PASS               
+            for n=fliplr(backTo:nResp)
+                
+                k = obj.C1_desparse(n);
+                tplus = subsObs(k);
+                subsObs(k) = n;
+                
+                i = C{2}(n);
+                h = ET(:,i);
+
+                if tplus==0
+                    bigLambdaHat = zeros(obj.nClasses, obj.nClasses);
+                    smallLambdaHat = zeros(obj.nClasses, 1);
+                else
+                    bigLambdaHat = obj.bigLambdaBar(:,:,tplus);
+                    smallLambdaHat = obj.smallLambdaBar(:,tplus);
+                end
+                delta_Wmean = P_post(:,:,n)*smallLambdaHat;
+                delta_Ppost = P_post(:,:,n)*bigLambdaHat*(P_post(:,:,n)');
+
+                 Wmean_post(:,n) = Wmean_post(:,n) - delta_Wmean;                
+                 P_post(:,:,n) = P_post(:,:,n) - delta_Ppost;
+
+%                 display('updating controversially early in smoother - potentially over-smoothing');
+                eta_tpost(n) = h' * Wmean_post(:, n);                
+                r_tpost(n) = h' * P_post(:,:,n) * h;      
+                
+                invA = 1./obj.r_tminus(n);
+                
+                z = eta_tpost(n) - obj.eta_tminus(n);               
+                R(n) = 1-(r_tpost(n)./obj.r_tminus(n));
+                
+                hinvAR = h*(invA .* R(n));           
+                hinvAz = h* (z .* invA);
+                
+                B = I - obj.K_kal(:,n)*h';                
+                obj.smallLambdaBar(:,n) = -hinvAz + B'*smallLambdaHat;
+                obj.bigLambdaBar(:,:,n) = hinvAR*h' + B'*bigLambdaHat*B;
+
+                %Values for the VB updates: calculate the alphas
+                %each class by setting inputs to 1 for each class
+                r_tvb = diag(P_post(:,:,n));
+
+                k_tvb = (1./r_tvb) .* (1+exp(Wmean_post(:,n)));
+                m_tvb = k_tvb .* (1+exp(-Wmean_post(:,n)));
+  
+                obj.Alpha(:, 1, n) = k_tvb;
+                obj.AlphaSum(:, 1, n) = m_tvb;
+            end
+            obj.Alpha(:, 2, :) = obj.AlphaSum(:, 1, :) - obj.Alpha(:, 1, :);
+            obj.AlphaSum(:, 2, :) = obj.AlphaSum(:, 1, :);
+
+            AlphaBundle = {obj.Alpha obj.Alpha_t};
+                        
+            obj.C3 = C{3};
+        end
+               
+        function AlphaBundle = updateAlphaMultiClass(obj, C, ET, ~, ~)
+            
+            %What would be the effect of automatically grouping updates.
+            %E.g. updates that are consistent (where q_t==0, i.e. don't increase uncertainty) can be grouped
+            %together to remove the need to update each step. 
+            %Drawbacks: less smooth change, potentially more mistakes at state-change boundaries 
+            %Advantage: less fluctuation, more consolidation of data from
+            %when the agent was in a particular state
+            
+            nResp = length(C{1});
+            if isempty(obj.Alpha)
+                obj.Alpha = zeros(obj.nClasses, obj.nScores, nResp);
+                obj.Alpha_t = zeros(obj.nScores, nResp); %for the distribution over eta_t given all c and t
+                obj.AlphaSum = zeros(obj.nClasses, obj.nScores, nResp); %each score is a pseudocount from a different total!
+            elseif iscell(obj.Alpha)
+                obj.Alpha_t = obj.Alpha{2};
+                obj.Alpha = obj.Alpha{1};                
+            end
+
+            nClassifiers = length(obj.C1_desparse);%max(C{1});                
+       
+            startFrom = 1;
+            backTo = 1;
+            prevObs = zeros(1, nClassifiers);    
+            subsObs = zeros(1, nClassifiers);
+            
+            nNewPoints = nResp - size(obj.q_t,2);
+            
+            obj.q_t = [obj.q_t zeros(obj.nScores,nNewPoints)];
+            obj.eta_tminus = [obj.eta_tminus; zeros(nNewPoints, obj.nScores)];
+            obj.r_tminus = [obj.r_tminus; zeros(nNewPoints, obj.nScores)];
+            r_tpost = zeros(nResp, obj.nScores);
+            obj.K_kal = zeros(obj.nClasses, obj.nScores, nResp);
+            
+            I = eye(obj.nClasses, obj.nClasses);
+            
+            %previous observation for each classifier. 0 means no observations
+            Wmean_post = zeros(obj.nClasses, obj.nScores, nResp);
+            P_post = zeros(obj.nClasses, obj.nClasses, obj.nScores, nResp);
+            
+            eta_tpost = zeros(nResp, obj.nScores);
+
+            R = zeros(nResp, obj.nScores);
+            
+            changedFlags = ones(1,nResp);
+                                    
+            %FORWARD PASS
+            for n=startFrom:nResp      
+                
+                k = obj.C1_desparse(n);
+                tminus = prevObs(k);
+                
+                c = C{3}(n);
+                i = C{2}(n);
+                h = ET(:,i);
+%                 if sum(h)==0
+%                     display('corrupt ET');
+%                 end
+                if tminus==0
+                    Wmean_tminus = obj.Wmean0(:,:,n);
+                    P_tminus = reshape(obj.P0(:,:,n,:), obj.nClasses, obj.nClasses, obj.nScores);
+                    q_tminus = zeros(obj.nScores,1);
+                else
+                    Wmean_tminus = Wmean_post(:,:,tminus);
+                    P_tminus = P_post(:,:,:,tminus);
+                    q_tminus = obj.q_t(:, tminus);
+                end    
+                
+                eta_tminus_n = h' * Wmean_tminus;
+                              
+                for s=1:obj.nScores
+                    P_tminus(:,:,s) = P_tminus(:,:,s) + obj.settings.changeRateMod.*q_tminus(s) * I;
+                end
+                P_tminus_r = reshape(P_tminus(:,:,:), obj.nClasses, obj.nClasses*obj.nScores);
+                r_tminus_n = h' * reshape(h'*P_tminus_r, obj.nClasses, obj.nScores);                
+
+                k_t = (1./r_tminus_n) .* (1+exp(eta_tminus_n));
+
+                obj.eta_tminus(n,:) = eta_tminus_n; 
+                obj.r_tminus(n, :) = r_tminus_n;
+
+                m_t = k_t .* (1+exp(-eta_tminus_n));
+
+%                 if sum(isnan(k_t))>0
+%                     display('update !!!');
+%                 end
+                
+                y = zeros(1, obj.nScores); 
+                if c==0 %unknown
+                    y = k_t ./ m_t;
+                else
+                    y(c) = 1;
+                end 
+                
+                %estimate posteriors of eta and r
+                k_tpost = k_t + y;
+                denom = m_t-k_t+1-y;
+                eta_tpost(n,:) = log(k_tpost ./ denom);
+                r_tpost(n,:) = (1./k_tpost) + (1./denom);
+
+%                 u_tpost = prod(k_tpost ./ (m_t+1));
+%                 u_tminus  = prod(k_t./m_t);
+                u_tpost = k_tpost.*(m_t+1-k_tpost) ./ (m_t+1).^2;
+                u_tminus = k_t.*(m_t-k_t) ./ m_t.^2;
+                
+                obj.q_t(:,n) = ((u_tpost>u_tminus) .* (u_tpost-u_tminus))';
+%                  obj.q_t(n) = abs(u_tpost-u_tminus);
+                if c==0 
+                    labelUncertainty = y.*(1-y);
+                    obj.q_t(:, n) = obj.q_t(:, n) + labelUncertainty;      
+                end
+
+                corrections = isinf(r_tpost(n,:));
+                r_tpost(n,corrections) = r_tminus_n(corrections);
+                
+                tmp = reshape(P_tminus(:,:,:), obj.nClasses, obj.nClasses*obj.nScores)' * h;
+                K_kal_n = reshape(tmp, [obj.nClasses, obj.nScores]);
+%                 obj.K_kal(:,:,n) = K_kal_n;
+                
+                R(n,:) = 1-(r_tpost(n,:)./r_tminus_n);   
+
+                %calculate weight updates
+                for s=1:obj.nScores
+                    
+                    Wmean_post(:,s,n) = Wmean_tminus(:,s) + K_kal_n(:,s).*...
+                        (eta_tpost(n,s) - eta_tminus_n(s))./r_tminus_n(s);                    
+                    
+                    obj.K_kal(:,s,n) = K_kal_n(:,s)./r_tminus_n(s);
+                    Kh =  obj.K_kal(:,s,n) * h' ;
+                    P_post(:,:,s,n) = P_tminus(:,:,s) - (Kh * ... 
+                        P_tminus(:,:,s) .* R(n,s));
+                end 
+                
+                prevObs(k) = n;
+            end
+ 
+            %used to be nClassifiers, could use a lot of memory
+            obj.bigLambdaBar = zeros(obj.nClasses, obj.nClasses, obj.nScores, nResp);
+            obj.smallLambdaBar = zeros(obj.nClasses, obj.nScores, nResp);
+            
+            delta_Wmean = zeros(obj.nClasses, obj.nScores);
+            delta_Ppost = zeros(obj.nClasses, obj.nClasses, obj.nScores);
+
+            r_tvb = zeros(obj.nClasses, obj.nScores);
+                
+            %BACKWARD PASS               
+            for n=fliplr(backTo:nResp)
+                
+                k = obj.C1_desparse(n);
+                tplus = subsObs(k);
+                subsObs(k) = n;
+                
+                i = C{2}(n);
+                h = ET(:,i);
+
+                if tplus==0
+                    bigLambdaHat = zeros(obj.nClasses, obj.nClasses, obj.nScores);
+                    smallLambdaHat = zeros(obj.nClasses, obj.nScores);
+                else
+                    bigLambdaHat = obj.bigLambdaBar(:,:,:,tplus);
+                    smallLambdaHat = obj.smallLambdaBar(:,:,tplus);
+                end
+                for s=1:obj.nScores  
+                    delta_Wmean(:,s) = P_post(:,:,s,n)*smallLambdaHat(:, s);
+                    delta_Ppost(:,:,s) = P_post(:,:,s,n)*bigLambdaHat(:,:,s)*(P_post(:,:,s,n)');
+                end
+
+%                 r_tN = zeros(1,obj.nScores);                   
+                Wmean_post(:,:,n) = Wmean_post(:,:,n) - delta_Wmean;                
+                P_post(:,:,:,n) = P_post(:,:,:,n) - delta_Ppost;
+                
+                eta_tpost(n,:) = h' * Wmean_post(:,:,n);
+                
+                for s=1:obj.nScores                                                
+                    B = I - obj.K_kal(:,s,n) *h';                
+                    r_tpost(n, s) = h' * P_post(:,:,s,n) * h;
+                end
+                
+                invA = 1./obj.r_tminus(n,:);
+                
+                z = eta_tpost(n,:) - obj.eta_tminus(n,:);
+                hinvAz = h* (z .* invA);
+                
+                R(n,:) = 1-(r_tpost(n,:)./obj.r_tminus(n,:));
+                hinvAR = h*(invA .* R(n,:)); 
+                
+                for s=1:obj.nScores
+                    obj.smallLambdaBar(:,s,n) = -hinvAz(:,s) + B'*smallLambdaHat(:,s);
+                    obj.bigLambdaBar(:,:,s,n) = hinvAR(:,s)*h' + B'*bigLambdaHat(:,:,s)*B;
+
+                    %Values for the VB updates: calculate the alphas
+                    %each class by setting inputs to 1 for each class
+                    r_tvb(:,s) = diag(P_post(:,:,s,n));
+%                     r_tN(s) = h' * P_post(:,:,s,n) * h;                    
+                end
+%                 k_tN = (1./r_tN) .* (1+exp(h'*Wmean_post(:,:,n)));
+                k_tvb = (1./r_tvb) .* (1+exp(Wmean_post(:,:,n)));
+                m_tvb = k_tvb .* (1+exp(-Wmean_post(:,:,n)));
+                
+%                 invalidK = sum(k_tvb<0)>0;
+%                 
+%                 if invalidK
+%                     display(['negative alpha: ' num2str(i) ', worker ' num2str(k)...
+%                         ' with change flags ' num2str(changedFlags(n)) ...
+%                         ', subsequent i: ' num2str(tplus) ' which had change flags ' ...
+%                         num2str(changedFlags(tplus))]);
+%                     display(['chain ' num2str(changedFlags(obj.C1_desparse==k))]);
+%                 end
+%                 if sum(isnan(k_tvb)) > 0 
+%                     display('hello :(');
+%                 end
+%                 if sum(sum(k_tvb))==0
+%                     display('going to cause an error through dodgy backward pass');
+%                 end
+%                     
+%                 if ~invalidK
+%                     obj.Alpha_t(:, n) = k_tN;
+                    obj.Alpha(:, :, n) = k_tvb;
+                    obj.AlphaSum(:, :, n) = m_tvb;
+%                 else
+%                     display('Invalid Alpha: keeping the old values, which is:');
+%                     obj.Alpha_t(:, n)
+%                 end                    
+            end       
+            
+            AlphaBundle = {obj.Alpha obj.Alpha_t};
+            obj.C3 = C{3};
+        end
+
+        function [AlphaJPr AlphaJ] = lnPiPrior(obj, C, lnPi, ET)  
+            Eta = lnPi - repmat(sum(lnPi, 2), 1, obj.nScores) + lnPi;
+            AlphaJPr = zeros(obj.nScores, length(C{1})); %for the distribution over eta_t given the previous eta_t
+            AlphaJ = zeros(obj.nScores, length(C{1})); %for the distribution over eta_t given the previous eta_t and all c and t
+
+            nClassifiers = max(C{1});
+
+            I = eye(obj.nClasses, obj.nClasses);
+            
+            %previous observation for each classifier. 0 means no
+            %observations
+            nResp = length(C{1});
+            
+            prevObs = zeros(1, nClassifiers);            
+            Wmean_post = zeros(obj.nClasses, obj.nScores, nResp);
+            r_tminus_n = zeros(nResp, obj.nScores);
+            K_kal_n = zeros(obj.nClasses, nResp, obj.nScores);
+            obj.q_t = zeros(nClassifiers, obj.nScores);
+            eta_tpost = zeros(nResp, obj.nScores);
+            r_tpost = zeros(nResp, obj.nScores);       
+            R = zeros(nResp, obj.nScores);
+            P_post = zeros(obj.nClasses, obj.nClasses, obj.nScores, nResp);            
+            %FORWARD PASS
+            for n=1:nResp
+                
+                k = C{1}(n);
+                tminus = prevObs(k);
+                i = C{2}(n);
+                h = ET(:,i);
+                if tminus==0
+                    Wmean_tminus = obj.Wmean0(:,:,n);
+                    P_tminus = reshape(obj.P0(:,:,n,:), obj.nClasses, obj.nClasses, obj.nScores);
+                else
+                    Wmean_tminus = Wmean_post(:,:,tminus);
+                    P_tminus = P_post(:,:,:,tminus);
+                end    
+
+                %k is a row vector. Each column corresponds to a score
+                eta_tminus_n = h' * Wmean_tminus;                
+                
+                for s=1:obj.nScores
+                    P_tminus(:,:,s) = P_tminus(:,:,s) + obj.q_t(k, s)*I;
+                    r_tminus_n(n, s) = h' * P_tminus(:,:,s) * h;
+                end
+                
+                k_t = (1./r_tminus_n(n,:)) .* (1+exp(eta_tminus_n));
+                m_t = k_t .* (1+exp(-eta_tminus_n));                  
+
+                AlphaJPr(:,n) = k_t; 
+                if sum(isnan(k_t))>0
+                    display('oh no!');
+                end
+                
+                c = C{3}(n);                
+                y = k_t ./ m_t;
+                labelUncertainty = y.*(1-y); 
+                
+                if c~=0
+                    display('i do not think we should be here');
+                    y = zeros(1, obj.nScores); %from C   
+                    y(c) = 1;
+                    labelUncertainty = 0; %for the prior we are assuming the label is unknown
+                end
+                
+                %estimate posterior of r
+                r_tpost(n,:) = (1./(k_t+y)) + (1./(m_t-k_t+1-y));
+
+                prevObs(k) = n;                  
+
+                %estimate posteriors of eta and r
+                u_tpost = (k_t+y) .* (m_t-k_t+1-y) ./ (m_t+1).^2;
+                u_tminus = (k_t) .* (m_t-k_t) ./ (m_t).^2;
+                obj.q_t(k,:) = max([u_tpost-u_tminus; zeros(1,obj.nScores)], [], 1) + labelUncertainty;
+                
+                AlphaJ(:,n) = k_t+y;
+                
+                eta_tpost(n,:) = h'*Eta(:,:,n);
+                
+                %calculate weight updates
+                
+                diff = eta_tpost(n,:) - eta_tminus_n;
+                
+                for s=1:obj.nScores
+                    if isinf(r_tpost(n,s))
+                        r_tpost(n,s) = r_tminus_n(n,s); %near enough - a single update in the same direction will have minimal change
+                    end
+                    K_kal_n(:,n,s) = P_tminus(:,:,s)' * h / r_tminus_n(n,s); 
+                    R(n,s) = 1-(r_tpost(n,s)./r_tminus_n(n,s));
+                    Wmean_post(:,s,n) = Wmean_tminus(:,s) + K_kal_n(:,n,s)*diff(s);
+                    P_post(:,:,s,n) = P_tminus(:,:,s) - K_kal_n(:,n,s)*h'*P_tminus(:,:,s)*R(n,s);
+                    if sum(isnan(P_post(:,:,s,n)))>0
+                        display('oh no!!');
+                    end
+                    
+                    if sum(isnan(Wmean_post(:,s,n)))
+                        display('oh no!!!');
+                    end
+                end                
+            end                
+        end
+        
+        function [ElnPiBundle, AlphaBundle] = expectedLnPi(obj, C, ET, agentIdx, OldPostAlpha)
+            %specifying agentIdx means we only update for that agent from
+            %the last score in C and use the given counts for others
+
+            if nargin < 5
+                AlphaBundle = obj.updateAlpha(C, ET);
+            else
+                AlphaBundle = obj.updateAlpha(C, ET, agentIdx, OldPostAlpha);                  
+            end
+        
+            Alpha = AlphaBundle{1};
+            
+            try
+                normTerm = psi(obj.AlphaSum);
+                ElnPi = psi(Alpha) - normTerm;%repmat(normTerm,1,obj.nScores);
+                
+%                 ElnPi_t = psi(Alpha_t) - psi(repmat(sum(Alpha_t,1),obj.nScores,1));
+                ElnPiBundle = {ElnPi};
+            catch e
+                display(['psi error: ' e.message]);
+            end
+            
+        end
+
+        function [ET, pT] = expectedT(obj, C, lnP, lnPiBundle, nAssets)     
+            
+            if nargin < 6
+                nAssets = length(obj.targets);
+            end
+            
+            nonZeroScores = find(C{3}~=0);
+            nValid = length(nonZeroScores);
+            
+            validDecs = C{3}(nonZeroScores); % c
+            validN = C{2}(nonZeroScores); % index of data points
+
+            indx = sub2ind([obj.nScores length(nonZeroScores)], ...
+                            validDecs, ...
+                            nonZeroScores);     
+            lnPT = sparse(obj.nClasses, nAssets);
+            
+            lnPi = lnPiBundle{1};%Eta - log(1+exp(Eta));
+%             realIdxs = find(validN);
+            for j=1:obj.nClasses                
+                lnPT(j,:) = sparse(ones(1,nValid), validN', lnPi(j, indx), 1, nAssets);
+                lnPT(j,validN) = lnPT(j,validN) + lnP(j); %used to have realIdxs in place of validN
+            end
+            
+            rescale = 0;%repmat(-min(lnPT), obj.nClasses, 1);
+            expA = exp(lnPT(:,validN)+rescale);%used to have realIdxs in place of validN
+            expB = repmat(sum(expA,1), obj.nClasses, 1);
+            
+            %stop any extreme values from causing Na
+            expB(expA==Inf) = 1;
+            expA(expA==Inf) = 1;
+            
+            pT = sparse(obj.nClasses, nAssets);
+            pT(:, validN) = expA./expB;
+                        
+            ET = pT;            
+            if length(obj.targets)<1
+                return
+            end
+            ET = obj.Tmat;
+            ET(:, obj.testIdxs) = pT(:, obj.testIdxs);
+            obj.combinedPost = ET;
+%              ET(:, obj.targets~=0) = 0;
+%              ET(sub2ind(size(ET), double(obj.targets(obj.targets~=0)), find(obj.targets~=0) )) = 1;
+        end
+        
+        function combinedPost = combineCluster(obj, post, Tvec)   
+            obj.setTargets(Tvec);       
+            obj.nKnown = round(obj.nKnown);
+            C = obj.prepareC(post);
+            obj.C1_desparse = full(C{1});
+            obj.initAlpha(length(C{1}));            
+            [ET, nIt] = obj.combineScoreSet(C); 
+            obj.combinedPost = ET;
+            if obj.nClasses==2
+                combinedPost(1, :) = ET(2, :);
+            else
+%                 [maxVals, maxIdx] = max(ET, [], 1);
+                combinedPost = ET;%ET(sub2ind(size(ET), maxIdx, 1:length(maxIdx))) + maxIdx - 1;
+            end
+
+%             nItFile = sprintf('%s%s', obj.confSave, 'nIts_vb');
+%             if exist(nItFile, 'file');
+%                 prevNIts = dlmread(nItFile);
+%                 prevNIts = [prevNIts nIt];
+%             else
+%                 prevNIts = nIt;
+%             end
+%             dlmwrite(nItFile, prevNIts);
+            
+            display([num2str(nIt) ' iterations for IBCCVB. sequential=' num2str(obj.sequential)]);
+            
+%             [classifierIds finalIdxs] = unique(C{1}, 'last');
+%             finalAlpha = EAlpha(:,:,finalIdxs);
+%             finalAlpha(:,:,classifierIds) = finalAlpha;
+%             obj.Alpha = finalAlpha;
+        end  
+        
+        function [combinedPost, agentRatings] = combineDecisions(obj, baseOutputs, ~) 
+            % baseOutputs - a cell array with 3 cells; the first contains
+            % an ordered vector of base classifier IDs; the second contains a vector
+            % of object IDs for the objects to be classified; the third
+            % contains the base classifier output scores. 
+            % clusters - set to [] if not performing clustering
+            if isempty(obj.Alpha)
+                obj.Alpha = zeros(obj.nClasses, obj.nScores, length(baseOutputs{1}));                   
+            elseif iscell(obj.Alpha)
+%                 obj.Alpha = obj.Alpha{1};
+%                 newSamples = length(baseOutputs{1}) - size(obj.Alpha,3);
+%                 if newSamples>0
+                nSamples = length(baseOutputs{1});
+                obj.Alpha = zeros(obj.nClasses, obj.nScores, nSamples);
+                obj.Alpha_t = zeros(obj.nScores, nSamples);
+%                     obj.Alpha = cat(3, obj.Alpha, zeros(obj.nClasses, obj.nScores, newSamples));
+%                     obj.Alpha_t = cat(2, obj.Alpha_t, zeros(obj.nScores, newSamples));
+%                 end
+                
+            end
+            
+            %get the relevant inputs
+            combinedPost = obj.combineCluster( baseOutputs, obj.targets);    
+  
+            agentRatings = obj.Alpha;            
+        end        
+        
+        function initAlpha(obj, nDupes, Alpha)
+            if isempty(obj.Alpha0)
+                obj.Alpha0 = zeros(obj.nClasses, obj.nScores, nDupes);
+
+                obj.Alpha0(:, :, :) = 1 ./ obj.nScores;      
+                
+                %sequential version needs stronger priors to avoid assuming too much from the early data points
+                if obj.sequential
+                    obj.Alpha0 = Alpha + 2;
+                end
+            else
+                if size(obj.Alpha0, 3) < nDupes
+                    obj.setAlphaPrior(obj.Alpha0, true, nDupes);
+                end
+            end             
+        end       
+            
+        function [L, EEnergy, H] = lowerBound(obj, T, C, lnPiBundle, lnP, ~)
+
+            nResponses = length(C{1});
+            
+            lnPi_t = lnPiBundle{2};
+            
+            idxs = sub2ind([obj.nScores nResponses], C{3}, (1:nResponses)');            
+            ElnPC_t = lnPi_t(idxs);
+            ElnPC = sum(ElnPC_t);
+            
+            if size(lnP, 1) > size(lnP, 2)
+                lnP = lnP';
+            end
+            TargetCounts = sum(T, 2);            
+            ElnPT = sum(TargetCounts .* lnP', 1);
+        
+            [AlphaPr_t AlphaPost_t] = obj.lnPiPrior(C, lnPiBundle{1}, T);
+            ElnPPi_t = gammaln(sum(AlphaPr_t, 1))-sum(gammaln(AlphaPr_t),1) + sum((AlphaPr_t-1).*lnPi_t, 1);  
+            ElnPPi = sum(ElnPPi_t);
+            
+            ElnPP = gammaln(sum(obj.Nu0, 2))-sum(gammaln(obj.Nu0),2) + sum((obj.Nu0-1).*lnP, 2);
+            
+            EEnergy = ElnPC + ElnPT + ElnPPi + ElnPP;
+        
+            if size(lnP, 1) > size(lnP, 2)
+                lnP = lnP';
+            end            
+%             ElnQTMinusConst = sum(ElnPC_t) + sum(sum(T,2).*lnP');
+%             
+%             lnPi = Eta(:,idxs) - log(1+exp(Eta(:,idxs)));
+%             Z = 0;
+%             for j=1:obj.nClasses
+%                 Z = Z + exp(lnPi(j,:) .* lnP(j));
+%             end
+%             ElnQT = ElnQTMinusConst - log(sum(Z))
+            ElnQT = sum(sum(T(T~=0) .* log(T(T~=0))));
+                                    
+            ElnQPi_t = gammaln(sum(AlphaPost_t, 1))-sum(gammaln(AlphaPost_t),1) ...
+                + sum((AlphaPost_t-1).*lnPi_t, 1);
+            ElnQPi = sum(ElnQPi_t);
+
+            PostNu = obj.Nu0 + TargetCounts';
+            ElnQP = gammaln(sum(PostNu, 2))-sum(gammaln(PostNu),2) + sum((PostNu-1).*lnP, 2);
+            
+            H = - ElnQT - ElnQPi - ElnQP;
+            
+            L = EEnergy + H;
+        end
+        
+        function printPiEvolution(obj, ~, EAlpha, C)
+                    
+            EAlpha = EAlpha{1};
+            
+            classifiers = unique(C{1});
+            for k=classifiers'
+                display(['Pi for classifier ' num2str(k)]);
+                kidxs = find(C{1}==k)';
+                for n=[kidxs(1) kidxs(round(length(kidxs)/2)) kidxs(end)]
+                    display([num2str(n) ',  ' num2str(C{3}(n)) ',  ' num2str(obj.targets(C{2}(n)))]);
+                    EAlpha(:,:,n)
+                end
+            end            
+        end        
+    end 
+end
+

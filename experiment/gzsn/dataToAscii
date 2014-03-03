@@ -1,0 +1,15 @@
+
+dataDirectory = '/homes/49/edwin/matlab/combination/gzsnBundle/data';
+
+%filename for the dataset should be here. Requires the following fields:
+%1. classification ID
+%2. agent ID
+%3. asset ID
+%4. PTF type
+%5. PTF class
+if ~exist('filename', 'var')
+    filename = [dataDirectory '/gzsnData.mat'];
+end
+
+load(filename);
+

@@ -1,0 +1,18 @@
+PiSlices = cell(1,27);
+AlphaSlices = cell(1,27);
+filterMapSlices = cell(1,27);
+
+for i=1:26
+    [Pi{i} Alpha{i} filterMap{i}] = GetPiSlice(testData{1}, i*1000, 0, Alpha);
+end
+
+[Pi{27} Alpha{27} filterMap{27}] = GetPiSlice(testData{1}, 26558, 0, Alpha);
+
+gSlices = cell(1,27);
+PSlices = cell(1,27);
+avgPiSlices = cell(1,27);
+
+for i=1:26
+    [gSlices{i} PSlices{i} avgPiSlices{i}] = extractCommunities(Alpha3000, testData, snBaseOutputs, true);
+    display([num2str(i) ', ' num2str(numel(gSlices{i}))]);
+end

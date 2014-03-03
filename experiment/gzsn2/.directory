@@ -1,0 +1,13 @@
+[Desktop Entry]
+Icon=folder-favorites
+
+[Dolphin]
+PreviewsShown=true
+Sorting=2
+Timestamp=2013,10,30,12,13,58
+Version=3
+ViewMode=1
+VisibleRoles=Details_text,Details_size,Details_date,Details_type,CustomizedDetails
+
+[Settings]
+HiddenFilesShown=true

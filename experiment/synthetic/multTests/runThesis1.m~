@@ -1,0 +1,43 @@
+%Run this code from this directory
+%clear
+
+%load('/homes/49/edwin/results/agent_clustering_meam-magnitude_ordered_relabelling/data/5.mat');
+
+settings.thesis.exp1;
+
+if ~exist(expSet.getCombinerDir(), 'file')
+    mkdir(expSet.getCombinerDir());
+end
+
+%pick the combination methods to use.
+combMethods = {...
+     combiners.SimpleMajorityVoting.shortLabel,...
+    combiners.bcc.IbccEm.shortLabel,...
+    combiners.bcc.IbccSampling.shortLabel, ...
+    combiners.DlrCombiner.shortLabelRounded, ...
+    combiners.weighted.WeightedSum.shortLabelRounded,...
+    combiners.weighted.WeightedMajority.shortLabel, ...
+    combiners.weighted.NaiveBayesLogodds.precalcShortLabelRounded,...
+    combiners.weighted.Bma.subSubShortLabel, ...
+    %      combiners.bcc.IbccVb.shortLabel,...
+    %combiners.weighted.NaiveBayesLogodds.precalcShortLabel, ...
+    %combiners.SimpleMajorityVoting.shortLabelUnrounded, ...
+    };
+
+multCombTests;
+
+for i=1:nSettings
+    testLabels = [];
+    combinedPost = [];
+    for d=1:synthSet.nDatasets
+        combinedPost = [combinedPost combinedPostKnowns{d,i}];
+        testLabels = [testLabels labelsKnowns{d,i}];
+    end
+    knownLabels = labelledTestData(:, synthSet.nSensors()+1)';
+    
+    separateMethods = false;
+    aucOnly = false;
+    newFigure = true;
+    
+    graphs.ClassifierPerformanceGraph.drawRoc(combinedPost, knownLabels, combMethods, separateMethods, aucOnly, newFigure);
+end
